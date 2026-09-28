@@ -1,358 +1,580 @@
 --Discord: @syn1axx;   Roblox: @NebogomDanYo
 
-local DataStoreService = game:GetService("DataStoreService") -- Getting DataStoreService to save and load player quest data
-local Players = game:GetService("Players") -- Getting Players service to handle player join and leave events
-local ReplicatedStorage = game:GetService("ReplicatedStorage") -- Getting ReplicatedStorage to access shared packages
+local DataStoreService = game:GetService("DataStoreService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local Packages = ReplicatedStorage.Packages -- Points to the Packages folder holding modules
-local Trove = require(Packages.Trove) -- Loads Trove to handle cleanup of connections and tasks automatically
-local QuickNet = require(Packages.QuickNet) -- Loads QuickNet to not set up RemoteEvents manually
+local Packages = ReplicatedStorage.Packages
+local Trove = require(Packages.Trove)
+local QuickNet = require(Packages.QuickNet)
 
-local Data = QuickNet.Data -- Shortcut to QuickNet data type table
-local QuestStore = DataStoreService:GetDataStore("QuestsData") -- Creates or gets the datastore that holds quest data
+local Data = QuickNet.Data
+local QuestStore = DataStoreService:GetDataStore("QuestsData")
 
-local SaveDebounceInterval = 5 -- How often autosave loop checks for dirty players
-local ShutdownDeadline = 10 -- How long to wait for saves during server shutdown
-local SaveStagger = 0.1 -- Delay between saving each player to avoid datastore throttling
+-- 5s debounce prevents hammering datastore with unnecessary checks
+-- if we checked every frame or every change, wed waste tons of quota
+local SaveDebounceInterval = 5
+-- grace period for shutdown saves before server kills the process
+-- gives us time to persist player data without hanging indefinitely
+local ShutdownDeadline = 10
+-- stagger between saves avoids datastore throttling if many players dirty at once
+-- spreading saves across the 5s cycle is way better than firing them all instantly
+local SaveStagger = 0.1
 
-local QuestEvent = QuickNet:register("QuestUpdate", Data.String, Data.Any) -- Creates a remote event called QuestUpdate
+local QuestEvent = QuickNet:register("QuestUpdate", Data.String, Data.Any)
 
-local QuestService = {} -- The main service table that gets returned at the end
+local QuestService = {}
 
-local QuestDefinitions = {} -- Stores all loaded quest definitions by their Id
-local ActiveQuests = {} -- Tracks active quests per player (keyed by Player, then by QuestId)
-local CompletedQuests = {} -- Tracks completed quests per player (keyed by Player, then by QuestId)
-local DirtyPlayers = {} -- Tracks players who have unsaved changes that need to be persisted
+-- read-only after load. immutable so every player sees the same quest values
+-- if we could modify this at runtime, players would see different quest requirements
+local QuestDefinitions = {}
 
-local ServiceTrove = Trove.new() -- Creates a Trove that will manage every connection, tweens, and tasks
-local Initialized = false -- Guards against running Init more than once
+-- keyed by Player object so we can detect when they leave (Parent becomes nil)
+-- cant use UserId here because wed need to rebuild the whole table structure to clean up
+local ActiveQuests = {}
 
-local function GetKey(Player) -- Builds the datastore key for a player
-	return "Player_" .. Player.UserId -- Uses the UserId so it stays unique and stable
+-- separate from Active because quests can be completed and restarted
+-- if we only had one "state" field, wed need three states (active, completed, available)
+-- this design makes the logic cleaner and state transitions explicit
+local CompletedQuests = {}
+
+-- signal queue for autosave loop, not actual data store
+-- acts as a dirty flag. when a quest progresses, we dont save immediately because
+-- thats slow and wasteful. instead we just mark the player dirty and let the autosave loop
+-- pick them up on the next cycle. multiple changes coalesce into one save
+local DirtyPlayers = {}
+
+local ServiceTrove = Trove.new()
+-- guard against running Init more than once
+-- if we connected to player events twice wed save/load players twice
+local Initialized = false
+
+local function GetKey(Player)
+	-- UserId instead of Name because usernames can change; data would be orphaned under old key
+	-- a player changes their name, their old data becomes unreachable under the old key
+	-- by using a permanent identifier, we ensure their progress follows them forever
+	return "Player_" .. Player.UserId
 end
 
-local function IsValidDefinition(Definition) -- Checks if a quest definition table has all required fields
-	return typeof(Definition) == "table" -- Must be a table
-		and typeof(Definition.Id) == "string" -- Must have a string Id
-		and typeof(Definition.Description) == "string" -- Must have a string Description
-		and typeof(Definition.Required) == "number" -- Must have a numeric Required amount
-		and Definition.Required > 0 -- Required must be greater than zero
+local function IsValidDefinition(Definition)
+	-- Catch bad definitions at load time, not during gameplay
+	-- if a quest module returns garbage, we find out immediately when the server starts
+	-- and skip that quest. way better than discovering a nil field halfway through
+	-- if a quest has Required = 0 or negative, thats logically impossible
+	-- so we reject it upfront rather than letting it cause weird behavior later
+	return typeof(Definition) == "table"
+		and typeof(Definition.Id) == "string"
+		and typeof(Definition.Description) == "string"
+		and typeof(Definition.Required) == "number"
+		and Definition.Required > 0
 end
 
-local function SanitizeLoaded(Raw) -- Cleans up raw data loaded from the datastore
-	local Clean = {} -- The sanitized table which will return
-	if typeof(Raw) ~= "table" then -- If the loaded data is not a table
-		return Clean -- Return an empty table instead
+local function SanitizeLoaded(Raw)
+	-- filter to only expected fields
+	-- handles corrupted data (from old code versions, manual edits, bugs, etc)
+	-- also means downstream code never has to validate anything
+	-- everything that touches this data knows it has exactly Progress and Completed
+	local Clean = {}
+	if typeof(Raw) ~= "table" then
+		-- if somehow the datastore returned a string or number or nil, just start fresh
+		-- way better than crashing or trying to iterate over it
+		return Clean
 	end
 
-	for QuestId, Entry in pairs(Raw) do -- Goes through each quest entry
-		local IsValid = typeof(Entry) == "table" -- Each entry must be a table
-			and typeof(Entry.Progress) == "number" -- Must have a numeric Progress
-			and typeof(Entry.Completed) == "boolean" -- Must have a boolean Completed
+	for QuestId, Entry in pairs(Raw) do
+		-- each Entry must have Progress (numeric) and Completed (boolean)
+		-- if either is missing or the wrong type, we skip this entry
+		-- prevents downstream code from hitting nil reference errors or type mismatches
+		-- e.g. if Progress were nil, math.clamp(nil, 0, 5) would crash
+		local IsValid = typeof(Entry) == "table"
+			and typeof(Entry.Progress) == "number"
+			and typeof(Entry.Completed) == "boolean"
 
-		if IsValid then -- If the entry passes validation
-			Clean[QuestId] = { -- Store only the important fields
-				Progress = Entry.Progress, -- The saved progress amount
-				Completed = Entry.Completed, -- Whether the quest was completed
+		if IsValid then
+			-- rebuild table instead of copying Entry directly
+			-- this strips any legacy fields from old quest systems
+			-- also makes explicit exactly what fields we consider valid
+			-- if someone tries to add a new field to the structure, it gets dropped
+			-- on load, which is intentional
+			Clean[QuestId] = {
+				Progress = Entry.Progress,
+				Completed = Entry.Completed,
 			}
 		end
 	end
 
-	return Clean -- Returns the cleaned data
+	return Clean
 end
 
-local function LoadPlayerData(Player) -- Loads player quest data from the datastore
-	local Success, Result = pcall(function() -- Wraps the call in pcall to catch errors
-		return QuestStore:GetAsync(GetKey(Player)) -- Fetches the saved data using the player key
+local function LoadPlayerData(Player)
+	-- wrap in pcall because datastore operations are network I/O
+	-- network can timeout, datastore can throttle (too many requests at once),
+	-- servers can have temporary outages. any of these make GetAsync fail
+	-- without pcall, the whole server crashes and kicks everyone
+	-- with pcall, one player loads empty data and keeps playing
+	local Success, Result = pcall(function()
+		return QuestStore:GetAsync(GetKey(Player))
 	end)
 
-	if not Success then -- If the fetch failed
-		return {} -- Return empty data so the player starts fresh
+	if not Success then
+		-- player starts with blank state instead of error state
+		-- they can still play and progress quests normally
+		-- on their next save (5s from now in the autosave loop),
+		-- that progress gets persisted to datastore
+		return {}
 	end
 
-	return SanitizeLoaded(Result) -- Returns the sanitized loaded data
+	-- always sanitize loaded data even on success
+	-- datastore might contain garbage from previous bugs or manual edits
+	-- centralized validation means every code path gets the same guarantees
+	return SanitizeLoaded(Result)
 end
 
-local function SavePlayerData(Player) -- Saves player quest data to the datastore
-	local Active = ActiveQuests[Player] -- Grabs player active quests
-	local Completed = CompletedQuests[Player] -- Grabs player completed quests
-	if not Active and not Completed then -- If the player has no data at all
-		return false -- Nothing to save
+local function SavePlayerData(Player)
+	-- grab both active and completed quests
+	local Active = ActiveQuests[Player]
+	local Completed = CompletedQuests[Player]
+	if not Active and not Completed then
+		-- if player hasnt started any quests, theres nothing to save
+		-- dont waste a datastore operation on empty data
+		return false
 	end
 
-	local Payload = {} -- The table which going to merge into the datastore
+	local Payload = {}
 
-	for QuestId, Quest in pairs(Active or {}) do -- Goes through each active quest
-		Payload[QuestId] = { Progress = Quest.Progress, Completed = false } -- Marks it as not completed with its progress
+	-- iterate active quests first and mark them as not completed
+	-- this establishes the baseline state for the save
+	for QuestId, Quest in pairs(Active or {}) do
+		Payload[QuestId] = { Progress = Quest.Progress, Completed = false }
 	end
 
-	for QuestId in pairs(Completed or {}) do -- Goes through each completed quest
-		if not Payload[QuestId] then -- If it wasnt already added as active
-			Payload[QuestId] = { Progress = 0, Completed = true } -- Marks it as completed with zero progress
+	-- iterate completed quests
+	-- only add them if they werent already added as active above
+	-- why? because a quest might be in both tables momentarily (completed this frame)
+	-- if we overwrote Active data with Completed data, we lose progress
+	-- Active is the source of truth so Active wins if theres a conflict
+	for QuestId in pairs(Completed or {}) do
+		if not Payload[QuestId] then
+			-- completed quests get Progress = 0 as a placeholder
+			-- the Completed flag is whats important; progress doesnt matter when youre done
+			Payload[QuestId] = { Progress = 0, Completed = true }
 		end
 	end
 
-	local PayloadCount = 0 -- Counter for how many entries are in the payload
-	for _ in pairs(Payload) do PayloadCount += 1 end -- Counts each entry
+	local PayloadCount = 0
+	for _ in pairs(Payload) do PayloadCount += 1 end
 
-	if PayloadCount == 0 then -- If there is nothing to save
-		return true -- Treat it as a successful no-op
+	if PayloadCount == 0 then
+		-- no data to save; treat as success so we dont retry
+		return true
 	end
 
-	local Success, Error = pcall(function() -- Wraps the update in pcall to catch errors
-		QuestStore:UpdateAsync(GetKey(Player), function(Current) -- Uses UpdateAsync to safely merge with existing data
-			local Merged = SanitizeLoaded(Current) -- Cleans whatever is already in the datastore
+	-- UpdateAsync instead of SetAsync because UpdateAsync is atomic and merge-friendly
+	-- heres why: if another server (or even another coroutine) updates the datastore
+	-- between our read and write, UpdateAsync ensures we dont lose their changes
+	-- SetAsync would blindly overwrite, causing data loss in multi-server setups
+	-- UpdateAsync passes us the current data in the callback, so we can merge intelligently
+	local Success, Error = pcall(function()
+		QuestStore:UpdateAsync(GetKey(Player), function(Current)
+			-- Current is whatever is already in the datastore (might have been updated by another server)
+			-- we sanitize it and then merge our Payload into it
+			local Merged = SanitizeLoaded(Current)
 
-			for QuestId, Entry in pairs(Payload) do -- Goes through our new payload
-				Merged[QuestId] = Entry -- Overwrites or adds each entry
+			-- merge our new data into whatever already exists
+			-- this is additive: we update keys in Payload, but we dont delete other keys
+			-- if a quest was in the datastore but not in our Payload, it stays
+			-- this is intentional for data preservation
+			for QuestId, Entry in pairs(Payload) do
+				Merged[QuestId] = Entry
 			end
 
-			return Merged -- Returns the merged result to be saved
+			-- return Merged tells UpdateAsync to save this new state atomically
+			return Merged
 		end)
 	end)
 
-	if not Success then -- If the save failed
-		return false -- Return failure so the player stays dirty
+	if not Success then
+		-- if the save failed (throttle, timeout, etc), return false
+		-- the autosave loop sees false and re-marks the player dirty
+		-- they get retried on the next cycle (5s later)
+		-- automatic retry is simpler and more resilient than forcing immediate retry
+		return false
 	end
 
-	return true -- Return success
+	return true
 end
 
-local function MarkDirty(Player) -- Flags a player as having unsaved changes
-	if Player and Player.Parent then -- Only mark if the player still exists
-		DirtyPlayers[Player] = true -- Adds them to the dirty set
-	end
-end
-
-local function LoadQuestDefinitions() -- Loads all quest definition modules from ReplicatedStorage
-	local Shared = ReplicatedStorage:WaitForChild("Shared") -- Waits for the Shared folder
-	local QuestsFolder = Shared:WaitForChild("Quests") -- Waits for the Quests folder inside it
-
-	for _, Module in ipairs(QuestsFolder:GetChildren()) do -- Goes through every child of the Quests folder
-		if not Module:IsA("ModuleScript") then -- If its not a ModuleScript
-			continue -- Skip it
-		end
-
-		local Ok, Definition = pcall(require, Module) -- Tries to require the module safely
-		if not Ok then -- If requiring failed
-			continue -- Skip this module
-		end
-
-		if IsValidDefinition(Definition) then -- If the definition is valid
-			QuestDefinitions[Definition.Id] = Definition -- Stores it by its Id
-		end
+local function MarkDirty(Player)
+	-- only mark if player still in game
+	-- Player.Parent is nil after they disconnect
+	-- if we mark a disconnected player dirty, the autosave loop will waste time trying to save them
+	if Player and Player.Parent then
+		-- adding to DirtyPlayers signals the autosave loop to save them
+		-- multiple changes (progress 5 times, complete a quest) all get batched into one save
+		-- this is way more efficient than saving after every single change
+		DirtyPlayers[Player] = true
 	end
 end
 
-local function SendQuestUpdate(Player, Action, Quest) -- Sends a quest update to a specific player
-	QuestEvent:FireClient(Player, Action, { -- Fires the remote with the action and quest data
-		Id = Quest.Id, -- The quest Id
-		Description = Quest.Description, -- The quest description
-		Required = Quest.Required, -- How much is needed
-		Progress = Quest.Progress, -- Current progress
+local function LoadQuestDefinitions()
+	local Shared = ReplicatedStorage:WaitForChild("Shared")
+	local QuestsFolder = Shared:WaitForChild("Quests")
+
+	-- dynamically load quests from the folder
+	-- means new quests can be added without touching this code
+	-- just drop a new ModuleScript into Quests/ and itll load automatically
+	for _, Module in ipairs(QuestsFolder:GetChildren()) do
+		if not Module:IsA("ModuleScript") then
+			-- skip non-script objects (folders, etc)
+			continue
+		end
+
+		-- wrap require in pcall because a ModuleScript might have a syntax error
+		-- or throw an exception during require
+		-- if we didnt catch errors, one broken quest module would prevent the server from starting
+		-- with pcall, we skip the broken one and continue loading others
+		-- server boots with whatever quests loaded successfully
+		local Ok, Definition = pcall(require, Module)
+		if not Ok then
+			continue
+		end
+
+		-- validate the returned definition before storing it
+		-- a developer might accidentally return invalid data from their quest module
+		-- validating here means no bad definitions make it into the system
+		-- another fail-gracefully checkpoint
+		if IsValidDefinition(Definition) then
+			QuestDefinitions[Definition.Id] = Definition
+		end
+	end
+end
+
+local function SendQuestUpdate(Player, Action, Quest)
+	-- send quest state to client whenever it changes
+	-- client needs this to update UI (progress, quest list, etc)
+	-- we construct a new table with only the fields we want to send
+	-- dont send the entire Quest object; that leaks implementation details
+	-- only expose the fields the client needs to render UI
+	QuestEvent:FireClient(Player, Action, {
+		Id = Quest.Id,
+		Description = Quest.Description,
+		Required = Quest.Required,
+		Progress = Quest.Progress,
 	})
 end
 
-local function CompleteQuest(Player, Quest) -- Marks a quest as completed for a player
-	QuestEvent:FireClient(Player, "Completed", { Id = Quest.Id }) -- Tells the client the quest is done
+local function CompleteQuest(Player, Quest)
+	-- notify client immediately when a quest completes
+	-- they need to show the completion effect/animation/popup right away
+	QuestEvent:FireClient(Player, "Completed", { Id = Quest.Id })
 
-	CompletedQuests[Player] = CompletedQuests[Player] or {} -- Ensures the completed table exists
-	CompletedQuests[Player][Quest.Id] = true -- Marks the quest as completed
-	ActiveQuests[Player][Quest.Id] = nil -- Removes it from active quests
+	CompletedQuests[Player] = CompletedQuests[Player] or {}
+	CompletedQuests[Player][Quest.Id] = true
+	-- remove from active so it doesnt show up in GetActiveQuest results
+	-- semantically, active means "in progress"; completed quests are not active
+	ActiveQuests[Player][Quest.Id] = nil
 end
 
-local function HydrateAndSend(Player, Saved) -- Rebuilds player quest state from saved data and sends it to the client
-	ActiveQuests[Player] = ActiveQuests[Player] or {} -- Ensures the active table exists
-	CompletedQuests[Player] = CompletedQuests[Player] or {} -- Ensures the completed table exists
+local function HydrateAndSend(Player, Saved)
+	-- reconstruct runtime state from datastore data
+	-- happens when a player joins; we load their saved state and rebuild it in memory
+	-- then send all their quests to the client so their UI is in sync
+	ActiveQuests[Player] = ActiveQuests[Player] or {}
+	CompletedQuests[Player] = CompletedQuests[Player] or {}
 
-	for QuestId, SavedEntry in pairs(Saved) do -- Goes through each saved entry
-		local Definition = QuestDefinitions[QuestId] -- Looks up the quest definition
-		if not Definition then -- If there is no definition for this quest
-			continue -- Skip it
+	for QuestId, SavedEntry in pairs(Saved) do
+		-- look up the quest definition for this QuestId
+		-- datastore only stores Progress and Completed; it doesnt store the full definition
+		local Definition = QuestDefinitions[QuestId]
+		if not Definition then
+			-- quest definition was removed from the game
+			-- if we tried to use it, wed hit nil reference errors
+			-- safer to skip it and let the player lose that quest
+			-- they can still play other quests
+			continue
 		end
 
-		if SavedEntry.Completed then -- If the quest was completed
-			CompletedQuests[Player][QuestId] = true -- Just mark it as completed
-			continue -- Move to the next one
+		if SavedEntry.Completed then
+			-- already completed, just mark it and move on
+			-- dont need to rebuild the full quest object
+			-- completed quests dont need progress displayed
+			CompletedQuests[Player][QuestId] = true
+			continue
 		end
 
-		local Quest = { -- Builds the active quest object
-			Id = Definition.Id, -- The quest Id
-			Description = Definition.Description, -- The quest description
-			Required = Definition.Required, -- How much is needed
-			Progress = math.clamp(SavedEntry.Progress, 0, Definition.Required), -- Clamps progress between 0 and required
+		-- rebuild the active quest by copying fields from Definition
+		-- Progress comes from SavedEntry (what they had saved before)
+		-- but we clamp it between 0 and Required
+		-- why clamp? because if data got corrupted or definition changed,
+		-- we prevent nonsensical states (negative progress or 999% complete)
+		local Quest = {
+			Id = Definition.Id,
+			Description = Definition.Description,
+			Required = Definition.Required,
+			Progress = math.clamp(SavedEntry.Progress, 0, Definition.Required),
 		}
 
-		ActiveQuests[Player][QuestId] = Quest -- Stores the active quest
-		SendQuestUpdate(Player, "Started", Quest) -- Tells the client the quest has started
+		ActiveQuests[Player][QuestId] = Quest
+		-- send a Started event to the client so they reconstruct their UI
+		-- this is necessary because the client might have restarted or they might be rejoining
+		-- server is the source of truth; we replicate that truth to client UI
+		SendQuestUpdate(Player, "Started", Quest)
 	end
 end
 
-local function OnPlayerAdded(Player) -- Handles a player joining the game
-	local Saved = LoadPlayerData(Player) -- Loads their saved quest data
-	HydrateAndSend(Player, Saved) -- Rebuilds their state and sends it to the client
+local function OnPlayerAdded(Player)
+	-- when a player joins, load their saved data and rebuild their state
+	local Saved = LoadPlayerData(Player)
+	HydrateAndSend(Player, Saved)
 end
 
-local function OnPlayerRemoving(Player) -- Handles a player leaving the game
-	pcall(SavePlayerData, Player) -- Tries to save their data one last time
+local function OnPlayerRemoving(Player)
+	-- player is leaving; try to save their data one last time
+	-- pcall prevents exceptions here from crashing other disconnect handlers
+	pcall(SavePlayerData, Player)
 
-	DirtyPlayers[Player] = nil -- Removes them from the dirty set
-	ActiveQuests[Player] = nil -- Clears their active quests
-	CompletedQuests[Player] = nil -- Clears their completed quests
+	-- clean up all memory associated with this player
+	-- if we didnt remove entries from these tables, they would grow forever
+	-- after a few thousand join/leave cycles, wed run out of RAM
+	DirtyPlayers[Player] = nil
+	ActiveQuests[Player] = nil
+	CompletedQuests[Player] = nil
 end
 
-function QuestService:RegisterQuest(Definition) -- Public function to register a quest definition at runtime
-	assert(IsValidDefinition(Definition), "Invalid quest definition") -- Makes sure the definition is valid
-	QuestDefinitions[Definition.Id] = Definition -- Stores it by its Id
-end
+function QuestService:StartQuest(Player, QuestOrId)
+	-- public API accepts either a quest table or just a quest ID string
+	-- this flexibility lets callers pass what they have
+	-- either they already have the Definition and can pass it directly,
+	-- or they just know the ID and we look it up
+	local QuestId = typeof(QuestOrId) == "table" and QuestOrId.Id or QuestOrId
+	local Definition = typeof(QuestOrId) == "table" and QuestOrId or QuestDefinitions[QuestId]
 
-function QuestService:StartQuest(Player, QuestOrId) -- Public function to start a quest for a player
-	local QuestId = typeof(QuestOrId) == "table" and QuestOrId.Id or QuestOrId -- Supports passing either a table or an Id string
-	local Definition = typeof(QuestOrId) == "table" and QuestOrId or QuestDefinitions[QuestId] -- Resolves the definition
-
-	if not Definition then -- If there is no definition
-		return -- Nothing to start
+	if not Definition then
+		-- quest doesnt exist; silently do nothing instead of erroring
+		-- if a quest was removed while theyre in the menu, we dont want to crash
+		-- just return silently
+		return
 	end
 
-	ActiveQuests[Player] = ActiveQuests[Player] or {} -- Ensures the active table exists
-	CompletedQuests[Player] = CompletedQuests[Player] or {} -- Ensures the completed table exists
+	ActiveQuests[Player] = ActiveQuests[Player] or {}
+	CompletedQuests[Player] = CompletedQuests[Player] or {}
 
-	if ActiveQuests[Player][Definition.Id] then -- If the quest is already active
-		return -- Dont start it again
+	-- check if the quest is already active
+	-- if a player calls StartQuest twice for the same quest, ignore the second call
+	-- this prevents duplicate quests or accidentally resetting progress to 0
+	-- the function is idempotent: calling it 5 times has the same effect as calling it once
+	if ActiveQuests[Player][Definition.Id] then
+		return
 	end
 
-	CompletedQuests[Player][Definition.Id] = nil -- Removes it from completed so it can be redone
+	-- remove from completed so it can be restarted
+	-- this is the key to supporting repeatable quests
+	-- admin gives player permission to retry? remove from Completed, call StartQuest again
+	CompletedQuests[Player][Definition.Id] = nil
 
-	local Quest = { -- Builds the active quest object
-		Id = Definition.Id, -- The quest Id
-		Description = Definition.Description, -- The quest description
-		Required = Definition.Required, -- How much is needed
-		Progress = 0, -- Starts at zero progress
+	local Quest = {
+		Id = Definition.Id,
+		Description = Definition.Description,
+		Required = Definition.Required,
+		Progress = 0,
 	}
 
-	ActiveQuests[Player][Definition.Id] = Quest -- Stores the active quest
-	SendQuestUpdate(Player, "Started", Quest) -- Tells the client the quest has started
-	MarkDirty(Player) -- Flags the player as needing a save
+	ActiveQuests[Player][Definition.Id] = Quest
+	SendQuestUpdate(Player, "Started", Quest)
+	MarkDirty(Player)
 end
 
-function QuestService:AddProgress(Player, Amount, QuestId) -- Public function to add progress to a quest
-	if typeof(Amount) ~= "number" or Amount <= 0 then -- If the amount is invalid
-		return -- Nothing to do
+function QuestService:AddProgress(Player, Amount, QuestId)
+	-- validate amount upfront
+	-- negative progress doesnt make sense (cant un-progress)
+	-- zero progress is a no-op
+	-- so we reject anything <= 0 to prevent silent bugs
+	if typeof(Amount) ~= "number" or Amount <= 0 then
+		return
 	end
 
-	local Active = ActiveQuests[Player] -- Grabs player active quests
-	if not Active then -- If they have none
-		return -- Nothing to do
+	local Active = ActiveQuests[Player]
+	if not Active then
+		-- no active quests; nothing to update
+		return
 	end
 
-	local function Bump(Quest) -- Inner helper that adds progress to one quest
-		Quest.Progress = math.min(Quest.Progress + Amount, Quest.Required) -- Adds progress but caps at required
+	local function Bump(Quest)
+		-- add progress but cap it at Required
+		-- why cap? because a quest is complete when Progress >= Required
+		-- if we let Progress go over (say 150 out of 100), it wouldnt change completion state
+		-- but it would confuse UI rendering (progress bar at 150%?)
+		-- capping at Required is cleaner and matches how quest systems normally work
+		Quest.Progress = math.min(Quest.Progress + Amount, Quest.Required)
 
-		SendQuestUpdate(Player, "Progress", Quest) -- Tells the client about the progress
+		-- notify client immediately so their progress bar updates in real-time
+		-- better UX than waiting for the next save cycle
+		SendQuestUpdate(Player, "Progress", Quest)
 
-		if Quest.Progress >= Quest.Required then -- If the quest is now complete
-			CompleteQuest(Player, Quest) -- Marks it as completed
+		-- check if quest is now complete
+		-- threshold is >= not == because if Amount overshoots (e.g. gain 50 when Required is 30),
+		-- we want to complete immediately, not require another call
+		if Quest.Progress >= Quest.Required then
+			CompleteQuest(Player, Quest)
 		end
 	end
 
-	if QuestId then -- If a specific quest Id was given
-		local Quest = Active[QuestId] -- Grabs that quest
-		if Quest then -- If it exists
-			Bump(Quest) -- Adds progress to it
+	if QuestId then
+		-- specific quest ID provided
+		-- update only that quest (useful for "kill this specific enemy" mechanics)
+		local Quest = Active[QuestId]
+		if Quest then
+			Bump(Quest)
 		end
-	else -- Otherwise
-		for _, Quest in pairs(Active) do -- Goes through every active quest
-			Bump(Quest) -- Adds progress to each one
+	else
+		-- no QuestId provided means apply to all active quests
+		-- useful for "gain 10 experience" mechanics that progress everything at once
+		for _, Quest in pairs(Active) do
+			Bump(Quest)
 		end
 	end
 
-	MarkDirty(Player) -- Flags the player as needing a save
+	MarkDirty(Player)
 end
 
-function QuestService:GetActiveQuest(Player, QuestId) -- Public function to get player active quests
-	local Active = ActiveQuests[Player] -- Grabs player active quests
-	if not Active then -- If they have none
-		return nil -- Return nothing
+function QuestService:GetActiveQuest(Player, QuestId)
+	-- read-only query function
+	-- doesnt modify state, just retrieves it
+	-- good API design: separate queries from mutations
+	local Active = ActiveQuests[Player]
+	if not Active then
+		return nil
 	end
 
-	if QuestId then -- If a specific quest Id was given
-		return Active[QuestId] -- Return just that one
+	if QuestId then
+		-- specific quest requested
+		return Active[QuestId]
 	end
 
-	return Active -- Otherwise return the whole table
+	-- no ID specified means return all active quests
+	return Active
 end
 
-function QuestService:IsCompleted(Player, QuestId) -- Public function to check if a quest is completed
-	local Completed = CompletedQuests[Player] -- Grabs player completed quests
-	return Completed ~= nil and Completed[QuestId] == true -- Returns true only if it exists and is marked done
+function QuestService:IsCompleted(Player, QuestId)
+	-- check both that the completed table exists AND that quest is marked done
+	-- prevents nil errors if player never completed anything
+	-- ensures accurate completion state
+	local Completed = CompletedQuests[Player]
+	return Completed ~= nil and Completed[QuestId] == true
 end
 
-function QuestService:Save(Player) -- Public function to force a save for a player
-	local Ok = SavePlayerData(Player) -- Tries to save
-	if Ok then -- If it succeeded
-		DirtyPlayers[Player] = nil -- Clear the dirty flag
+function QuestService:Save(Player)
+	-- force immediate save outside the autosave cycle
+	-- normally saves happen on the 5s cycle but this lets you trigger now
+	local Ok = SavePlayerData(Player)
+	if Ok then
+		-- clear dirty flag if save succeeded
+		-- prevents this player from being re-saved unnecessarily in the next cycle
+		DirtyPlayers[Player] = nil
 	end
-	return Ok -- Return the result
+	return Ok
 end
 
-function QuestService:Init() -- Initializes the service, wires up events, and starts the auto-save loop
-	if Initialized then -- If already initialized
-		return -- Dont do it again
+function QuestService:Init()
+	-- initialize the entire quest system
+	-- sets up event connections, the autosave loop, shutdown handler
+	-- called once at server startup
+	if Initialized then
+		return
 	end
 
-	Initialized = true -- Marks us as initialized
+	Initialized = true
 
-	LoadQuestDefinitions() -- Loads all quest definitions from ReplicatedStorage
+	LoadQuestDefinitions()
 
-	ServiceTrove:Add(Players.PlayerAdded:Connect(OnPlayerAdded)) -- Hooks up the player joined event
-	ServiceTrove:Add(Players.PlayerRemoving:Connect(OnPlayerRemoving)) -- Hooks up the player leaving event
+	-- connect to player join/leave events
+	-- track connections in ServiceTrove so they get cleaned up later
+	ServiceTrove:Add(Players.PlayerAdded:Connect(OnPlayerAdded))
+	ServiceTrove:Add(Players.PlayerRemoving:Connect(OnPlayerRemoving))
 
-	for _, Player in ipairs(Players:GetPlayers()) do -- Goes through any players already in the game
-		task.spawn(OnPlayerAdded, Player) -- Handles them as if they just joined
+	-- handle players who were already in the game before this script ran
+	-- e.g. if youre testing in studio with an existing player
+	-- spawn them as tasks so they run concurrently instead of sequentially
+	for _, Player in ipairs(Players:GetPlayers()) do
+		task.spawn(OnPlayerAdded, Player)
 	end
 
-	ServiceTrove:Add(task.spawn(function() -- Starts the auto-save loop as a tracked task
-		while true do -- Runs forever until the trove is destroyed
-			task.wait(SaveDebounceInterval) -- Waits the debounce interval
+	-- the main autosave loop
+	-- this is the heartbeat of the quest persistence system
+	ServiceTrove:Add(task.spawn(function()
+		while true do
+			-- wait for the debounce interval before checking for dirty players
+			task.wait(SaveDebounceInterval)
 
-			local ToSave = {} -- Collects the players that need to save
+			local ToSave = {}
 
-			for Player in pairs(DirtyPlayers) do -- Goes through every dirty player
-				table.insert(ToSave, Player) -- Adds them to the list
+			-- collect all dirty players into a list first
+			-- dont save while iterating over DirtyPlayers because modifying it during iteration
+			-- can cause us to miss players or save duplicates
+			for Player in pairs(DirtyPlayers) do
+				table.insert(ToSave, Player)
 			end
 
-			for _, Player in ipairs(ToSave) do -- Goes through each player to save
-				DirtyPlayers[Player] = nil -- Clears the dirty flag optimistically
+			-- iterate over ToSave and save each player
+			-- clear the dirty flag optimistically (before saving)
+			-- if the save succeeds, great, we saved time
+			-- if it fails, we immediately re-mark them dirty to retry next cycle
+			for _, Player in ipairs(ToSave) do
+				DirtyPlayers[Player] = nil
 
-				if Player.Parent then -- If the player is still in the game
-					local Ok = SavePlayerData(Player) -- Tries to save
+				-- check if the player is still in the game
+				-- they might have left between when we collected ToSave and now
+				-- if theyre gone, dont waste time trying to save
+				if Player.Parent then
+					local Ok = SavePlayerData(Player)
 
-					if not Ok then -- If the save failed
-						DirtyPlayers[Player] = true -- Mark them dirty again to retry next cycle
+					-- if the save failed, mark them dirty again
+					-- theyll be retried on the next autosave cycle
+					if not Ok then
+						DirtyPlayers[Player] = true
 					end
 				end
 
-				task.wait(SaveStagger) -- Waits a bit before the next player to avoid throttling
+				-- wait between saves to avoid datastore throttling
+				-- throttling happens when you fire too many requests at once
+				-- spreading them across the 5s cycle (one every 0.1s) prevents that
+				task.wait(SaveStagger)
 			end
 		end
 	end))
 
-	game:BindToClose(function() -- Hooks up the server shutdown handler
-		local Threads = {} -- Collects the save threads
+	-- handle server shutdown gracefully
+	-- when roblox shuts down the server, this callback runs first
+	-- we have time to save all player data before the process terminates
+	game:BindToClose(function()
+		local Threads = {}
 
-		for _, Player in ipairs(Players:GetPlayers()) do -- Goes through every player still in the game
-			table.insert(Threads, task.spawn(function() -- Starts a save thread for each
-				SavePlayerData(Player) -- Tries to save their data
+		-- spawn a save thread for each player still connected
+		-- spawn lets them all run in parallel instead of one after another
+		-- much faster than sequential saves
+		for _, Player in ipairs(Players:GetPlayers()) do
+			table.insert(Threads, task.spawn(function()
+				SavePlayerData(Player)
 			end))
 		end
 
-		local Deadline = os.clock() + ShutdownDeadline -- Calculates the absolute deadline
-		for _, Thread in ipairs(Threads) do -- Goes through each save thread
-			while coroutine.status(Thread) ~= "dead" and os.clock() < Deadline do -- Waits until it finishes or the deadline run out of time
-				task.wait(0.1) -- Small wait to avoid busy looping
+		-- calculate the absolute deadline for shutdown
+		-- we wait up to ShutdownDeadline seconds but no more
+		local Deadline = os.clock() + ShutdownDeadline
+
+		-- wait for each save thread to finish, but with a hard deadline
+		-- if a save thread is still running when we hit the deadline,
+		-- we stop waiting and let the server shut down anyway
+		-- better to miss one save than hang the server forever and fail to restart
+		for _, Thread in ipairs(Threads) do
+			while coroutine.status(Thread) ~= "dead" and os.clock() < Deadline do
+				-- loop with small waits instead of a single long wait
+				-- this lets us check if the deadline has been exceeded frequently
+				-- so we exit as soon as possible after the deadline
+				task.wait(0.1)
 			end
 		end
 	end)
 end
 
-return QuestService -- Returns the service so other scripts can require and use it
+return QuestService
